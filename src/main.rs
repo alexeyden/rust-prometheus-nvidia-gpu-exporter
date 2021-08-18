@@ -1,5 +1,3 @@
-#![feature(async_closure)]
-
 extern crate prometheus;
 
 extern crate nvml_wrapper;
@@ -62,6 +60,9 @@ struct Collector {
     total_memory_gauge: IntGaugeVec,
     free_memory_gauge: IntGaugeVec,
     used_memory_gauge: IntGaugeVec,
+    decoder_utilization_gauge: IntGaugeVec,
+    pcie_throughput_tx_gauge: IntGaugeVec,
+    pcie_throughput_rx_gauge: IntGaugeVec,
 }
 
 impl Collector {
@@ -166,6 +167,21 @@ impl Collector {
             IntGaugeVec::new(process_memory_used_opts, &PROCESS_LABELS)?;
         registry.register(Box::new(process_memory_used_gauge.clone()))?;
 
+        // Decoder utilization
+        let decoder_utilization_opts = Opts::new("decoder_utilization", "Percent of video decoder utilization");
+        let decoder_utilization_gauge = IntGaugeVec::new(decoder_utilization_opts, &LABELS)?;
+        registry.register(Box::new(decoder_utilization_gauge.clone()))?;
+
+        // PCIe throughput TX
+        let pcie_throughput_tx_opts = Opts::new("pcie_throughput_tx", "PCIe throughput (sending from GPU) in KB/sec");
+        let pcie_throughput_tx_gauge = IntGaugeVec::new(pcie_throughput_tx_opts, &LABELS)?;
+        registry.register(Box::new(pcie_throughput_tx_gauge.clone()))?;
+
+        // PCIe throughput RX
+        let pcie_throughput_rx_opts = Opts::new("pcie_throughput_rx", "PCIe throughput (sending from CPU) in KB/sec");
+        let pcie_throughput_rx_gauge = IntGaugeVec::new(pcie_throughput_rx_opts, &LABELS)?;
+        registry.register(Box::new(pcie_throughput_rx_gauge.clone()))?;
+
         // Process
         let collector = Collector {
             nvml,
@@ -182,6 +198,9 @@ impl Collector {
             total_memory_gauge,
             free_memory_gauge,
             used_memory_gauge,
+            decoder_utilization_gauge,
+            pcie_throughput_tx_gauge,
+            pcie_throughput_rx_gauge,
         };
 
         Ok(collector)
@@ -266,66 +285,30 @@ impl Collector {
                     .get_metric_with_label_values(&labels)?
                     .set(memory_info.used as i64);
             }
+
+            // Decoder
+            if let Ok(decoder_info) = device.decoder_utilization() {
+                self.decoder_utilization_gauge
+                    .get_metric_with_label_values(&labels)?
+                    .set(decoder_info.utilization as i64);
+            }
+
+            // PCIe throughput Tx
+            if let Ok(tx) = device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Send) {
+                self.pcie_throughput_tx_gauge
+                    .get_metric_with_label_values(&labels)?
+                    .set(tx as i64);
+            }
+
+            // PCIe throughput Rx
+            if let Ok(rx) = device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Receive) {
+                self.pcie_throughput_rx_gauge
+                    .get_metric_with_label_values(&labels)?
+                    .set(rx as i64);
+            }
         }
 
         Ok(())
-    }
-
-    fn process(&self) -> Result<String> {
-        let num_devices = self.nvml.device_count()?;
-
-        let mut lines = Vec::<String>::new();
-
-        for device_num in 0..num_devices {
-            let device = self.nvml.device_by_index(device_num)?;
-            let uuid = device.uuid()?;
-            let name = device.name()?;
-
-            let temperature = device
-                .temperature(TemperatureSensor::Gpu)
-                .expect("Temperature");
-            let gpu_usage = device.utilization_rates().expect("GPU").gpu;
-            let memory_info = device.memory_info().expect("Memory");
-
-            let mut pvec = Vec::<String>::new();
-            for process in device.running_compute_processes()? {
-                let pid = process.pid as i32;
-                if let Ok(proc) = procfs::process::Process::new(pid) {
-                    let cmd = &proc.cmdline().expect("cmd name not found")[0];
-                    let user_id = proc.owner;
-                    let owner = users::get_user_by_uid(user_id).expect("User not found");
-                    let mem = match process.used_gpu_memory {
-                        Used(x) => ((x / 1024 / 1024) as u64).to_string(),
-                        _ => "?".to_string()
-                    };
-
-                    let s = format!(
-                        "{}:{}/{}({} MiB)",
-                        owner.name().to_str().expect("Encoding error"),
-                        cmd,
-                        pid,
-                        mem,
-                    );
-                    pvec.push(s)
-                }
-            }
-
-            let line = format!(
-                "[{}] {}|{}|{:>3}°C {:>3}%| {:>6} / {:<6} MiB | {}",
-                device_num,
-                name,
-                uuid,
-                temperature,
-                gpu_usage,
-                (memory_info.used / 1024 / 1024) as u64,
-                (memory_info.total / 1024 / 1024) as u64,
-                pvec.join(" ")
-            );
-
-            lines.push(line);
-        }
-
-        Ok(lines.join("\n") + "\n")
     }
 }
 
@@ -354,14 +337,6 @@ async fn main() {
                                 .header(CONTENT_TYPE, encoder.format_type())
                                 .body(Body::from(buffer))
                                 .expect("Failed to build metrics response")
-                        }
-                        (&Method::GET, "/gpustat") => {
-                            let s = c.process().expect("Failed process query");
-                            Response::builder()
-                                .status(200)
-                                .header(CONTENT_TYPE, encoder.format_type())
-                                .body(Body::from(s))
-                                .expect("Failed to build gpustat response")
                         }
                         _ => Response::builder()
                             .status(StatusCode::NOT_FOUND)
